@@ -1,120 +1,174 @@
-import base64
 import functions_framework
+import google.cloud.storage as storage
 import google.cloud.bigquery as bigquery
-import google.generativeai as genai
 import json
 import os
 import uuid
+import base64
 from datetime import datetime
+from bs4 import BeautifulSoup
+from google.auth.transport.requests import Request
+from google.oauth2.credentials import Credentials
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
+
+# Configuration
+SCOPES = ["https://www.googleapis.com/auth/gmail.modify"]
+BUCKET_NAME = "property-parser-token"
+TOKEN_FILE_NAME = "token.json"
+EMAIL_ADDRESS = "daisaku.okada@okamolife.com"
 
 
-def setup_gemini():
-    """Gemini APIのセットアップ"""
-    genai.configure(api_key=os.environ.get('GEMINI_API_KEY'))
-    return genai.GenerativeModel('gemini-pro')
-
-
-def analyze_email_with_gemini(model, email_content, email_subject):
-    """Geminiを使用してメールの内容を解析"""
-    prompt = f"""
-    以下の不動産物件情報メールから、必要な情報を抽出してJSON形式で返してください。
-    未記載の項目はnullとしてください。
-
-    メールタイトル：
-    {email_subject}
-
-    メール本文：
-    {email_content}
-
-    以下の形式で出力してください：
-    {{
-        "property_name": "物件名",
-        "property_type": "物件種別",
-        "postal_code": "郵便番号",
-        "prefecture": "都道府県",
-        "city": "市区町村",
-        "address": "番地以降の住所",
-        "price": 価格（数値）,
-        "monthly_fee": 月額費用（数値）,
-        "management_fee": 管理費（数値）,
-        "floor_area": 専有面積（数値）,
-        "floor_number": 階数（数値）,
-        "total_floors": 総階数（数値）,
-        "nearest_station": "最寄駅",
-        "station_distance": 駅までの距離（数値）,
-        "building_age": 築年数（数値）,
-        "construction_date": "建築年月日（YYYY-MM-DD形式）",
-        "features": ["設備1", "設備2"],
-        "status": "募集中",
-        "source_company": "情報提供会社",
-        "company_phone": "電話番号",
-        "company_email": "メールアドレス",
-        "property_url": "URL",
-        "road_price": 路線価（数値）,
-        "estimated_price": 積算価格（数値）,
-        "current_rent_income": 現況家賃収入（数値）,
-        "expected_rent_income": 想定家賃収入（数値）,
-        "yield_rate": 利回り（数値）,
-        "land_area": 敷地面積（数値）
-    }}
-    """
-
-    response = model.generate_content(prompt)
-    return json.loads(response.text)
-
-
-@functions_framework.cloud_event
-def process_property_emails(cloud_event):
-    """Cloud Functionsのメインハンドラー"""
+def setup_gmail_service():
+    """Gmail APIのセットアップ - トークンベースの認証を使用"""
+    print("=== setup_gmail_service: 開始 ===")
     try:
-        # メールデータの取得（Pub/Subからのメッセージ）
-        pubsub_message = base64.b64decode(cloud_event.data["message"]["data"]).decode()
-        email_data = json.loads(pubsub_message)
+        print("1. Storage Clientの初期化")
+        storage_client = storage.Client()
+        bucket = storage_client.bucket(BUCKET_NAME)
+        token_blob = storage.Blob(TOKEN_FILE_NAME, bucket)
 
-        # Geminiのセットアップ
-        model = setup_gemini()
+        print("2. 認証情報の確認開始")
+        creds = None
+        if token_blob.exists():
+            print("3. トークンファイルが存在します")
+            token_str = token_blob.download_as_string()
+            token_json = json.loads(token_str)
+            creds = Credentials.from_authorized_user_info(token_json, SCOPES)
+            print("4. 認証情報を読み込みました")
 
-        # メールの解析
-        analysis_result = analyze_email_with_gemini(
-            model,
-            email_data.get('content', ''),
-            email_data.get('subject', '')
-        )
+        if not creds or not creds.valid:
+            print("5. 認証情報の更新が必要です")
+            if creds and creds.expired and creds.refresh_token:
+                print("6. トークンをリフレッシュします")
+                creds.refresh(Request())
+                # 更新されたトークンを保存
+                with open("/tmp/token.json", 'w') as token:
+                    token.write(creds.to_json())
+                token_blob.upload_from_filename(filename="/tmp/token.json")
+                print("7. 新しいトークンを保存しました")
+            else:
+                print("8. エラー: 有効な認証情報がありません")
+                raise Exception("Invalid credentials. Please re-authenticate.")
 
-        # BigQueryクライアントの初期化
-        client = bigquery.Client()
-
-        # 必須フィールドの追加
-        analysis_result.update({
-            'id': str(uuid.uuid4()),
-            'email_id': email_data.get('id', ''),
-            'email_subject': email_data.get('subject', ''),
-            'email_body': email_data.get('content', ''),
-            'email_received_at': datetime.now().isoformat(),
-            'email_from': email_data.get('from', ''),
-            'created_at': datetime.now().isoformat(),
-            'updated_at': datetime.now().isoformat()
-        })
-
-        # BigQueryに保存
-        table_id = f"{os.environ['PROJECT_ID']}.property_data.properties"
-        errors = client.insert_rows_json(table_id, [analysis_result])
-
-        if errors:
-            raise Exception(f"BigQuery insertion errors: {errors}")
+        print("9. Gmailサービスの構築開始")
+        service = build('gmail', 'v1', credentials=creds)
+        print("=== setup_gmail_service: 完了 ===")
+        return service
 
     except Exception as e:
-        # エラーログの保存
-        error_data = {
-            'error_id': str(uuid.uuid4()),
-            'email_id': email_data.get('id', ''),
-            'error_type': type(e).__name__,
-            'error_message': str(e),
-            'email_content': email_data.get('content', ''),
-            'created_at': datetime.now().isoformat()
+        print(f"ERROR in setup_gmail_service: {str(e)}")
+        raise
+
+
+def get_unread_emails(service):
+    """未読メールの取得と解析"""
+    print("=== get_unread_emails: 開始 ===")
+    try:
+        print("1. 未読メールの検索開始")
+        results = service.users().messages().list(
+            userId='me',
+            q='is:unread'
+        ).execute()
+
+        if not results.get('messages'):
+            print("2. 未読メールはありません")
+            return []
+
+        print(f"3. 未読メール数: {len(results.get('messages', []))}")
+        emails = []
+        for index, message in enumerate(results['messages']):
+            print(f"\n--- メール {index + 1} の処理開始 ---")
+            try:
+                msg = service.users().messages().get(
+                    userId='me',
+                    id=message['id'],
+                    format='full'
+                ).execute()
+
+                print(f"4. メールID {message['id']} の内容を取得")
+                payload = msg['payload']
+                headers = payload['headers']
+
+                # ヘッダー情報の取得
+                subject = next((h['value'] for h in headers if h['name'].lower() == 'subject'), 'No Subject')
+                from_email = next((h['value'] for h in headers if h['name'].lower() == 'from'), '')
+                date = next((h['value'] for h in headers if h['name'].lower() == 'date'), '')
+
+                print(f"5. ヘッダー情報: Subject={subject}, From={from_email}")
+
+                # 本文の取得とデコード
+                body = ''
+                if 'parts' in payload:
+                    print("6. マルチパートメールの処理")
+                    for part in payload['parts']:
+                        if part.get('mimeType') == 'text/plain' and 'data' in part.get('body', {}):
+                            encoded_data = part['body']['data']
+                            encoded_data = encoded_data.replace("-", "+").replace("_", "/")
+                            body = base64.b64decode(encoded_data).decode('utf-8', 'ignore')
+                            print("7. プレーンテキスト部分を取得")
+                            break
+                elif 'body' in payload and 'data' in payload['body']:
+                    print("8. シンプルメールの処理")
+                    encoded_data = payload['body']['data']
+                    encoded_data = encoded_data.replace("-", "+").replace("_", "/")
+                    body = base64.b64decode(encoded_data).decode('utf-8', 'ignore')
+
+                if not body:
+                    print("9. 本文が空のためスキップ")
+                    continue
+
+                print("10. メールを既読にマーク")
+                service.users().messages().modify(
+                    userId='me',
+                    id=message['id'],
+                    body={'removeLabelIds': ['UNREAD']}
+                ).execute()
+
+                emails.append({
+                    'id': message['id'],
+                    'subject': subject,
+                    'from': from_email,
+                    'date': date,
+                    'content': body
+                })
+                print(f"11. メール {index + 1} の処理完了")
+
+            except Exception as e:
+                print(f"ERROR processing email {message['id']}: {str(e)}")
+                continue
+
+        print(f"\n=== get_unread_emails: 完了 (処理メール数: {len(emails)}) ===")
+        return emails
+
+    except Exception as e:
+        print(f"ERROR in get_unread_emails: {str(e)}")
+        return []
+
+
+@functions_framework.http
+def process_property_emails(request):
+    """メインハンドラー"""
+    print("\n=== process_property_emails: 開始 ===")
+    try:
+        print("1. Gmailサービスの初期化開始")
+        gmail_service = setup_gmail_service()
+
+        print("4. 未読メールの取得開始")
+        emails = get_unread_emails(gmail_service)
+        if not emails:
+            print("5. 未読メールはありません")
+            return {'status': 'success', 'message': 'No unread emails found'}
+
+        processed_count = len(emails)
+        print(f"6. 処理完了 (処理メール数: {processed_count})")
+
+        return {
+            'status': 'success',
+            'processed_emails': processed_count,
+            'message': f'Successfully processed {processed_count} emails'
         }
 
-        error_table_id = f"{os.environ['PROJECT_ID']}.property_data.error_logs"
-        client.insert_rows_json(error_table_id, [error_data])
-
-        raise e
+    except Exception as e:
+        print(f"ERROR in process_property_emails: {str(e)}")
+        return {'status': 'error', 'message': str(e)}, 500
