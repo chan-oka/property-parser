@@ -16,23 +16,25 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from vertexai.generative_models import GenerativeModel
 from email.utils import parsedate_to_datetime
+from tenacity import retry, stop_after_attempt, wait_fixed, retry_if_exception_type
+from json.decoder import JSONDecodeError
 
 # Configuration
 SCOPES = ["https://www.googleapis.com/auth/gmail.modify"]
-BUCKET_NAME = "property-parser-token"
-TOKEN_FILE_NAME = "token.json"
-EMAIL_ADDRESS = "daisaku.okada@okamolife.com"
+BUCKET_NAME = os.environ['BUCKET_NAME']
+TOKEN_FILE_NAME = os.environ['TOKEN_FILE_NAME']
+EMAIL_ADDRESS = os.environ['EMAIL_ADDRESS']
 
-# property_dataを作成する部分を修正
+
 def format_date(date_str):
+    """メールのタイムスタンプをBigQuery用のISO形式に変換"""
     try:
-        # メールのタイムスタンプをパース
         parsed_date = parsedate_to_datetime(date_str)
-        # BigQuery用のISO形式に変換
         return parsed_date.isoformat()
     except Exception as e:
         print(f"日付変換エラー: {e}")
         return datetime.now().isoformat()
+
 
 def setup_gmail_service():
     """Gmail APIのセットアップ - トークンベースの認証を使用"""
@@ -57,7 +59,6 @@ def setup_gmail_service():
             if creds and creds.expired and creds.refresh_token:
                 print("6. トークンをリフレッシュします")
                 creds.refresh(Request())
-                # 更新されたトークンを保存
                 with open("/tmp/token.json", 'w') as token:
                     token.write(creds.to_json())
                 token_blob.upload_from_filename(filename="/tmp/token.json")
@@ -75,21 +76,20 @@ def setup_gmail_service():
         print(f"ERROR in setup_gmail_service: {str(e)}")
         raise
 
+
 def setup_services():
     """全サービスの初期化"""
     print("=== setup_services: 開始 ===")
     try:
         # Gemini APIのセットアップ
         print("1. Gemini APIの初期化")
-
         vertexai.init(project=os.environ['PROJECT_ID'], location='us-central1')
 
         system_instruction = "あなたは優秀なエグゼクティブアシスタントです。毎日大量に届くメールから不動産の物件情報を正確に抽出・整理することを得意としています。"
         model = GenerativeModel(
             model_name="gemini-1.5-flash-001",
-            system_instruction=[
-                system_instruction
-            ])
+            system_instruction=[system_instruction]
+        )
 
         # Gmail APIのセットアップ
         print("2. Gmail APIの初期化")
@@ -105,90 +105,181 @@ def setup_services():
         print(f"ERROR in setup_services: {str(e)}")
         raise
 
-def get_unread_emails(service):
-    """未読メールの取得と解析"""
-    print("=== get_unread_emails: 開始 ===")
+
+def extract_email_headers(headers):
+    """メールヘッダーから必要な情報を抽出"""
     try:
-        print("1. 未読メールの検索開始")
-        results = service.users().messages().list(
-            userId='me',
-            q='is:unread',
-            maxResults=10
-        ).execute()
+        subject = next((h['value'] for h in headers if h['name'].lower() == 'subject'), 'No Subject')
+        from_email = next((h['value'] for h in headers if h['name'].lower() == 'from'), '')
+        date = next((h['value'] for h in headers if h['name'].lower() == 'date'), '')
+        return subject, from_email, date
+    except Exception as e:
+        print(f"Error extracting headers: {e}")
+        return 'No Subject', '', datetime.now().isoformat()
 
-        if not results.get('messages'):
-            print("2. 未読メールはありません")
-            return []
 
-        messages = results.get('messages', [])[:10]  # ここで10件に制限
-        print(f"3. 未読メール数: {len(messages)} (10件に制限)")
+def decode_email_body(payload):
+    """メール本文をデコード"""
+    try:
+        # text/plainの場合
+        if 'data' in payload.get('body', {}):
+            b64_message = payload['body']['data']
+        # text/htmlなどの場合
+        elif payload.get('parts') is not None:
+            b64_message = payload['parts'][0]['body']['data']
+        else:
+            return ''
 
-        print(f"3. 未読メール数: {len(results.get('messages', []))}")
-        emails = []
-        for index, message in enumerate(results['messages']):
-            print(f"\n--- メール {index + 1} の処理開始 ---")
-            try:
-                msg = service.users().messages().get(
-                    userId='me',
-                    id=message['id'],
-                    format='full'
-                ).execute()
+        # Base64デコード
+        encoded_data = b64_message.replace("-", "+").replace("_", "/")
+        return base64.b64decode(encoded_data).decode('utf-8', 'ignore')
+    except Exception as e:
+        print(f"Error decoding email body: {e}")
+        print(f"Payload structure: {json.dumps(payload, indent=2)[:500]}")
+        return ''
 
-                print(f"4. メールID {message['id']} の内容を取得")
-                payload = msg['payload']
-                headers = payload['headers']
+@retry(
+    stop=stop_after_attempt(3),  # 最大3回試行
+    wait=wait_fixed(3),  # 3秒間隔で待機
+    retry=retry_if_exception_type((Exception)),  # リトライする例外の種類
+    before_sleep=lambda retry_state: print(f"リトライ {retry_state.attempt_number}/3 を {3}秒後に実行します...")
+)
+def analyze_email_with_gemini(model, email_content, email_subject):
+    """メール内容をGeminiで分析"""
+    print("=== analyze_email_with_gemini: 開始 ===")
+    try:
+        time.sleep(3)  # APIレート制限対策
 
-                # ヘッダー情報の取得
-                subject = next((h['value'] for h in headers if h['name'].lower() == 'subject'), 'No Subject')
-                from_email = next((h['value'] for h in headers if h['name'].lower() == 'from'), '')
-                date = next((h['value'] for h in headers if h['name'].lower() == 'date'), '')
+        prompt = f"""
+        以下の不動産物件情報メールから、必要な情報を抽出してJSON形式で返してください。
 
-                print(f"5. ヘッダー情報: Subject={subject}, From={from_email}")
+        重要な注意事項：
+        - 未記載の項目はnullとしてください。
+        - メール内に複数の物件情報がある場合は、配列形式で全ての物件情報を返してください。
+        - 必ず配列形式で返してください。物件情報が1件の物件の場合でも配列として返してください。
 
-                # 本文の取得とデコード
-                body = ''
-                if 'parts' in payload:
-                    print("6. マルチパートメールの処理")
-                    for part in payload['parts']:
-                        if part.get('mimeType') == 'text/plain' and 'data' in part.get('body', {}):
-                            encoded_data = part['body']['data']
-                            encoded_data = encoded_data.replace("-", "+").replace("_", "/")
-                            body = base64.b64decode(encoded_data).decode('utf-8', 'ignore')
-                            print("7. プレーンテキスト部分を取得")
-                            break
-                elif 'body' in payload and 'data' in payload['body']:
-                    print("8. シンプルメールの処理")
-                    encoded_data = payload['body']['data']
-                    encoded_data = encoded_data.replace("-", "+").replace("_", "/")
-                    body = base64.b64decode(encoded_data).decode('utf-8', 'ignore')
+        数値データと日付に関する重要な規則：
+        - price（物件価格）: 数値のみで返してください。例："560万円" → 5600000
+        - yield_rate（利回り）: 数値のみで返してください。例："15.00%" → 15.00
+        - construction_date（建築年月日）: 必ずYYYY-MM-DD形式で返してください。
+          * 年月のみの場合（YYYY-MM）は、01日として YYYY-MM-01 の形式で返してください
+          * 例1: "1979-10" → "1979-10-01"
+          * 例2: "1979" → "1979-01-01"
+        - その他の数値フィールドも単位や記号は付けず、純粋な数値のみで返してください
+        - 数値は全て小数点以下2桁までとしてください
+        - features（設備）: 設備情報は全て配列に含めてください。数の制限はありません。
+        - station_distance: 必ず徒歩での所要時間を分単位の整数で返してください。
+          * 例1: "徒歩15分" → 15
+          * 例2: "徒歩5分" → 5
+          * 距離（km/m）が与えられた場合は、80m/分として計算してください
+          * 例3: "3.3km" → 41（3300m ÷ 80m/分 ≈ 41分）
+  
+        メールタイトル：
+        {email_subject}
 
-                if not body:
-                    print("9. 本文が空のためスキップ")
-                    continue
+        メール本文：
+        {email_content}
 
-                if not ('不動産' in body or '物件' in body):
-                    print("9.1 不動産関連のキーワードが含まれていないためスキップ")
-                    continue
+        JSON:
+        "property_name": "物件名"
+        "property_type": "物件種別"
+        "postal_code": "郵便番号"
+        "prefecture": "都道府県"
+        "city": "市区町村"
+        "address": "番地以降の住所"
+        "price": 物件価格（数値のみ。例：5600000）
+        "monthly_fee": 月額費用（数値のみ）
+        "management_fee": 管理費（数値のみ）
+        "floor_area": 専有面積（数値のみ）
+        "floor_number": 階数（数値のみ）
+        "total_floors": 総階数（数値のみ）
+        "railway_line": 路線名（例：「JR山手線 渋谷駅」の場合 → JR山手線）
+        "station_name": 駅名（例：「JR山手線 渋谷駅」の場合 → 渋谷駅）
+        "station_distance": 駅までの徒歩距離（分単位の整数値のみ。例：徒歩15分 → 15）
+        "building_age": 築年数（数値のみ）
+        "construction_date": "建築年月日（必ずYYYY-MM-DD形式。例：1979-10-01）"
+        "features": ["設備1", "設備2", ...]
+        "status": "募集中"
+        "source_company": "情報提供会社"
+        "company_phone": "電話番号"
+        "company_email": "メールアドレス"
+        "property_url": "URL"
+        "road_price": 路線価（数値のみ）
+        "estimated_price": 積算価格（数値のみ）
+        "current_rent_income": 現況家賃収入（数値のみ）
+        "expected_rent_income": 想定家賃収入（数値のみ）
+        "yield_rate": 利回り（数値のみ。例：15.00）
+        "land_area": 敷地面積（数値のみ）
+        """
 
-                emails.append({
-                    'id': message['id'],
-                    'subject': subject,
-                    'from': from_email,
-                    'date': date,
-                    'content': body
-                })
-                print(f"10. メール {index + 1} の処理完了")
+        response = model.generate_content(prompt, generation_config={"response_mime_type": "application/json"})
+        try:
+            result = json.loads(response.text)
+        except json.JSONDecodeError as e:
+            print(f"JSON パースエラー: {e}")
+            print(f"受信した応答: {response.text}")
+            return {
+                "error": "解析エラー",
+                "raw_response": response.text[:500]
+            }
 
-            except Exception as e:
-                print(f"ERROR processing email {message['id']}: {str(e)}")
-                continue
+        # 配列形式でない場合は例外として処理
+        if not isinstance(result, list):
+            print(f"""
+            === WARNING: Geminiからの応答が配列形式ではありません ===
+            応答タイプ: {type(result)}
+            応答内容: {result}
+            ===============
+            """)
+            raise ValueError("Gemini response must be an array")
 
-        print(f"\n=== get_unread_emails: 完了 (処理メール数: {len(emails)}) ===")
-        return emails
+        print(f"分析成功: {len(result)}件の物件情報を抽出")
+        return result
 
     except Exception as e:
-        print(f"ERROR in get_unread_emails: {str(e)}")
-        return []
+        print(f"Error in analyze_email_with_gemini: {str(e)}")
+        raise e
+
+
+def prepare_property_data(property_data, email_info):
+    """プロパティデータに必要なフィールドを追加"""
+    try:
+        current_time = datetime.now().isoformat()
+        property_data.update({
+            'id': str(uuid.uuid4()),
+            'email_id': email_info['id'],
+            'email_subject': email_info['subject'],
+            'email_body': email_info['body'],
+            'email_received_at': format_date(email_info['date']),
+            'email_from': email_info['from'],
+            'created_at': current_time,
+            'updated_at': current_time
+        })
+        return property_data
+    except Exception as e:
+        print(f"Error preparing property data: {e}")
+        return None
+
+
+def save_to_bigquery(bq_client, property_data_list):
+    """BigQueryにデータを保存"""
+    try:
+        if not property_data_list:
+            print("保存するデータがありません")
+            return False
+
+        table_id = f"{os.environ['PROJECT_ID']}.property_data.properties"
+        errors = bq_client.insert_rows_json(table_id, property_data_list)
+        if errors:
+            print(f"BigQuery insertion errors: {errors}")
+            return False
+
+        print(f"{len(property_data_list)}件の物件データをBigQueryに保存しました")
+        return True
+    except Exception as e:
+        print(f"Error saving to BigQuery: {e}")
+        return False
+
 
 def mark_as_read(service, message_id):
     """メールを既読にマーク"""
@@ -199,156 +290,195 @@ def mark_as_read(service, message_id):
             body={'removeLabelIds': ['UNREAD']}
         ).execute()
         print(f"メールID {message_id} を既読にマークしました")
+        return True
     except Exception as e:
         print(f"Error marking message {message_id} as read: {str(e)}")
-        raise
+        return False
 
-def analyze_email_with_gemini(model, email_content, email_subject):
-    """メール内容をGeminiで分析"""
-    print("=== analyze_email_with_gemini: 開始 ===")
+
+def filter_valid_properties(property_data_list):
+    """有効な物件データのみをフィルタリング"""
+    valid_properties = []
+    skipped_properties = []
+
+    for property_data in property_data_list:
+        if property_data.get('price') is not None:
+            valid_properties.append(property_data)
+        else:
+            skipped_properties.append(property_data.get('property_name', '名称不明'))
+
+    if skipped_properties:
+        print(
+            f"以下の物件は price が未設定のためスキップされました: {', '.join(str(name) for name in skipped_properties)}")
+
+    return valid_properties
+
+def process_property_email(message_data, service, model, bq_client):
+    """個別のメールを処理"""
     try:
-        time.sleep(1)
+        print(f"\n--- メールID {message_data['id']} の処理開始 ---")
 
-        prompt = f"""
-        以下の不動産物件情報メールから、必要な情報を抽出してJSON形式で返してください。
-        未記載の項目はnullとしてください。
+        # メール本文の取得
+        msg = service.users().messages().get(
+            userId='me',
+            id=message_data['id'],
+            format='full'
+        ).execute()
 
-        数値データと日付に関する重要な規則：
-        - price（価格）: 数値のみで返してください。例："560万円" → 5600000
-        - yield_rate（利回り）: 数値のみで返してください。例："15.00%" → 15.00
-        - construction_date（建築年月日）: 必ずYYYY-MM-DD形式で返してください。
-          * 年月のみの場合（YYYY-MM）は、01日として YYYY-MM-01 の形式で返してください
-          * 例1: "1979-10" → "1979-10-01"
-          * 例2: "1979" → "1979-01-01"
-        - その他の数値フィールドも単位や記号は付けず、純粋な数値のみで返してください
-        - 数値は全て小数点以下2桁までとしてください
+        # ヘッダー情報の抽出
+        subject, from_email, date = extract_email_headers(msg['payload']['headers'])
+        print(f"ヘッダー情報: Subject={subject}, From={from_email}")
 
-        メールタイトル：
-        {email_subject}
+        # 本文のデコード
+        body = decode_email_body(msg['payload'])
+        if not body:
+            print("本文が空のためスキップ")
+            return None
 
-        メール本文：
-        {email_content}
+        # 不動産関連チェック
+        if not ('不動産' in body or '物件' in body):
+            print("不動産関連のキーワードが含まれていないためスキップ")
+            return None
 
-        JSON:
-        "property_name": "物件名",
-        "property_type": "物件種別",
-        "postal_code": "郵便番号",
-        "prefecture": "都道府県",
-        "city": "市区町村",
-        "address": "番地以降の住所",
-        "price": 価格（数値のみ。例：5600000）,
-        "monthly_fee": 月額費用（数値のみ）,
-        "management_fee": 管理費（数値のみ）,
-        "floor_area": 専有面積（数値のみ）,
-        "floor_number": 階数（数値のみ）,
-        "total_floors": 総階数（数値のみ）,
-        "nearest_station": "最寄駅",
-        "station_distance": 駅までの距離（数値のみ）,
-        "building_age": 築年数（数値のみ）,
-        "construction_date": "建築年月日（必ずYYYY-MM-DD形式。例：1979-10-01）",
-        "features": ["設備1", "設備2"],
-        "status": "募集中",
-        "source_company": "情報提供会社",
-        "company_phone": "電話番号",
-        "company_email": "メールアドレス",
-        "property_url": "URL",
-        "road_price": 路線価（数値のみ）,
-        "estimated_price": 積算価格（数値のみ）,
-        "current_rent_income": 現況家賃収入（数値のみ）,
-        "expected_rent_income": 想定家賃収入（数値のみ）,
-        "yield_rate": 利回り（数値のみ。例：15.00）,
-        "land_area": 敷地面積（数値のみ）
-        """
+        # メール情報の整理
+        email_info = {
+            'id': message_data['id'],
+            'subject': subject,
+            'from': from_email,
+            'date': date,
+            'body': body
+        }
 
-        print("1. Geminiに分析リクエスト送信")
-        response = model.generate_content(prompt, generation_config={"response_mime_type": "application/json"})
-        print("2. Geminiから応答を受信")
-        print(f"応答内容: {response.text}")
+        # Geminiでの分析
+        print("Geminiでの分析開始")
+        print(f"subject: {subject}")
+        print(f"body: {body}")
 
-        try:
-            return json.loads(response.text)
-        except json.JSONDecodeError as e:
-            print(f"JSON パースエラー: {e}")
-            print(f"受信した応答: {response.text}")
-            # JSON パースに失敗した場合はエラー情報を含むデフォルト値を返す
-            return {
-                "error": "解析エラー",
-                "raw_response": response.text[:500],  # 応答の先頭500文字を保存
-            }
+        property_data_list = analyze_email_with_gemini(model, body, subject)
+        if not property_data_list:
+            print("Geminiでの分析結果が空のためスキップ")
+            return None
+
+        print(f"Geminiでの分析結果: {property_data_list}")
+
+        filtered_properties = filter_valid_properties(property_data_list)
+        if not filtered_properties:
+            print("処理可能な物件データがありません")
+            return None
+
+        # データの準備
+        processed_properties = []
+        for property_data in filtered_properties:
+            extended_data = prepare_property_data(property_data, email_info)
+            if extended_data:
+                processed_properties.append(extended_data)
+            else:
+                print("物件データの準備に失敗")
+
+        if not processed_properties:
+            print("処理可能な物件データがありません")
+            return None
+
+        # BigQueryへの保存
+        print("BigQueryへの保存開始")
+        if not save_to_bigquery(bq_client, processed_properties):
+            print("BigQueryへの保存に失敗")
+            return None
+
+        # メールを既読にマーク
+        if not mark_as_read(service, message_data['id']):
+            print("既読マークに失敗")
+            # 保存は完了しているのでエラーとはしない
+
+        print(f"メールID {message_data['id']} の処理が完了")
+        return {**email_info, 'properties': processed_properties}
+
     except Exception as e:
-        print(f"Error in analyze_email_with_gemini: {str(e)}")
-        raise
+        print(f"""
+        === ERROR: メール {message_data['id']} の処理中にエラー発生 ===
+        メールID: {message_data['id']}
+        エラータイプ: {type(e).__name__}
+        エラーメッセージ: {str(e)}
+        発生時刻: {datetime.now().isoformat()}
+        ===============
+        """)
+        return None
+
+
+def process_unread_property_emails(service, model, bq_client):
+    """未読の不動産関連メールを処理"""
+    print("=== process_unread_property_emails: 開始 ===")
+    processed_count = 0
+
+    try:
+        # 未読メールの検索
+        results = service.users().messages().list(
+            userId='me',
+            q='is:unread　to:fudousan.okada@gmail.com',
+            maxResults=100
+        ).execute()
+
+        if not results.get('messages'):
+            print("未読メールはありません")
+            return [], 0
+
+        messages = results.get('messages', [])
+        print(f"未読メール数: {len(messages)}")
+
+        processed_emails = []
+        for index, message in enumerate(messages):
+            print(f"\n--- メール {index + 1}/{len(messages)} の処理開始 ---")
+
+            result = process_property_email(message, service, model, bq_client)
+            if result:
+                processed_emails.append(result)
+                processed_count += 1
+                print(f"メール {index + 1} の処理が完了しました")
+            else:
+                print(f"メール {index + 1} の処理がスキップまたは失敗しました")
+
+        print(f"\n=== process_unread_property_emails: 完了 (処理完了: {processed_count}/{len(messages)}) ===")
+        return processed_emails, processed_count
+
+    except Exception as e:
+        print(f"ERROR in process_unread_property_emails: {str(e)}")
+        return [], 0
+
 
 @functions_framework.http
 def process_property_emails(request):
     """メインハンドラー"""
     print("\n=== process_property_emails: 開始 ===")
     try:
-        print("1. 各サービスの初期化開始")
+        # サービスの初期化
         gmail_service, model, bq_client = setup_services()
 
-        print("2. 未読メールの取得開始")
-        emails = get_unread_emails(gmail_service)
+        # メールの処理
+        emails, processed_count = process_unread_property_emails(gmail_service, model, bq_client)
+
         if not emails:
-            print("3. 未読メールはありません")
-            return {'status': 'success', 'message': 'No unread emails found'}
+            print("処理完了: メールは処理されませんでした")
+            return {
+                'status': 'success',
+                'message': 'No emails processed',
+                'processed_emails': 0,
+                'total_emails': 0
+            }
 
-        processed_count = 0
-        print(f"4. メール処理開始 (総数: {len(emails)})")
-
-        for email_data in emails:
-            try:
-                print(f"\n--- メール {email_data['id']} の分析開始 ---")
-                property_data = analyze_email_with_gemini(
-                    model,
-                    email_data['content'],
-                    email_data['subject']
-                )
-
-                # 必須フィールドの追加
-                current_time = datetime.now().isoformat()
-                property_data.update({
-                    'id': str(uuid.uuid4()),
-                    'email_id': email_data['id'],
-                    'email_subject': email_data['subject'],
-                    'email_body': email_data['content'],
-                    'email_received_at': format_date(email_data['date']),
-                    'email_from': email_data['from'],
-                    'created_at': current_time,
-                    'updated_at': current_time
-                })
-
-                # BigQueryに保存
-                print("5. BigQueryにデータを保存")
-                table_id = f"{os.environ['PROJECT_ID']}.property_data.properties"
-                errors = bq_client.insert_rows_json(table_id, [property_data])
-
-                if errors:
-                    raise Exception(f"BigQuery insertion errors: {errors}")
-
-                # print("6. メールを既読にマーク")
-                # mark_as_read(gmail_service, email_data['id'])
-                processed_count += 1
-
-            except Exception as e:
-                print(f"""
-                === ERROR: メール {email_data['id']} の処理中にエラー発生 ===
-                メールID: {email_data['id']}
-                エラータイプ: {type(e).__name__}
-                エラーメッセージ: {str(e)}
-                メール本文: {email_data['content']}
-                発生時刻: {datetime.now().isoformat()}
-                ===============
-                """)
-                continue
-
-        print(f"\n=== process_property_emails: 完了 (処理完了: {processed_count}/{len(emails)}) ===")
+        print(f"処理完了: {processed_count}件のメールが正常に処理されました")
         return {
             'status': 'success',
+            'message': f'Successfully processed {processed_count} emails',
             'processed_emails': processed_count,
             'total_emails': len(emails)
         }
 
     except Exception as e:
-        print(f"CRITICAL ERROR in process_property_emails: {str(e)}")
-        return {'status': 'error', 'message': str(e)}, 500
+        error_message = f"CRITICAL ERROR in process_property_emails: {str(e)}"
+        print(error_message)
+        return {
+            'status': 'error',
+            'message': error_message,
+            'processed_emails': 0,
+            'total_emails': 0
+        }, 500
