@@ -21,7 +21,7 @@ from email.utils import parsedate_to_datetime
 SCOPES = ["https://www.googleapis.com/auth/gmail.modify"]
 BUCKET_NAME = "property-parser-token"
 TOKEN_FILE_NAME = "token.json"
-EMAIL_ADDRESS = "daisaku.okada@okamolife.com"
+EMAIL_ADDRESS = "test@gmail.com"
 
 # property_dataを作成する部分を修正
 def format_date(date_str):
