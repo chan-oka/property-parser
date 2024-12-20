@@ -36,6 +36,30 @@ def format_date(date_str):
         return datetime.now().isoformat()
 
 
+def convert_to_yen(value):
+    """
+    万円単位の数値を円単位の整数値に変換する
+    例：
+        21.8 (21.8万円) -> 218,000円
+        0.5 (0.5万円) -> 5,000円
+    """
+    try:
+        if value is None:
+            return None
+
+        # 文字列の場合は数値に変換
+        if isinstance(value, str):
+            # カンマを除去して数値変換
+            value = value.replace(',', '')
+            value = float(value)
+
+        # float型の値を円単位で整数に変換（万円 → 円）
+        return int(value * 10000)
+
+    except (ValueError, TypeError) as e:
+        print(f"Warning: Failed to convert value to yen. Value: {value}, Error: {e}")
+        return None
+
 def setup_gmail_service():
     """Gmail APIのセットアップ - トークンベースの認証を使用"""
     print("=== setup_gmail_service: 開始 ===")
@@ -119,22 +143,75 @@ def extract_email_headers(headers):
 
 
 def decode_email_body(payload):
-    """メール本文をデコード"""
-    try:
-        # text/plainの場合
-        if 'data' in payload.get('body', {}):
-            b64_message = payload['body']['data']
-        # text/htmlなどの場合
-        elif payload.get('parts') is not None:
-            b64_message = payload['parts'][0]['body']['data']
-        else:
-            return ''
+    print(f"""
+    === Email Structure ===
+    MIME Type: {payload.get('mimeType')}
+    Has Parts: {'parts' in payload}
+    Parts Count: {len(payload.get('parts', []))}
+    ==================
+    """)
 
-        # Base64デコード
-        encoded_data = b64_message.replace("-", "+").replace("_", "/")
-        return base64.b64decode(encoded_data).decode('utf-8', 'ignore')
+    """
+    メール本文をデコード - multipart/mixedを含む様々なMIMEタイプに対応
+    """
+
+    def find_message_parts_text(message, message_parts=None):
+        if message_parts is None:
+            message_parts = {"text/plain": None, "text/html": None}
+
+        mimetype = message.get("mimeType", "")
+
+        # multipart形式の処理
+        if mimetype.startswith("multipart/"):
+            for part in message.get("parts", []):
+                find_message_parts_text(part, message_parts)
+            return message_parts
+
+        # text形式の処理
+        if mimetype == "text/plain" and message.get("body", {}).get("data"):
+            try:
+                data = message["body"]["data"]
+                text = base64.urlsafe_b64decode(data).decode("utf-8")
+                message_parts["text/plain"] = text
+            except Exception as e:
+                print(f"Error decoding text/plain: {e}")
+
+        elif mimetype == "text/html" and message.get("body", {}).get("data"):
+            try:
+                data = message["body"]["data"]
+                text = base64.urlsafe_b64decode(data).decode("utf-8")
+                message_parts["text/html"] = text
+            except Exception as e:
+                print(f"Error decoding text/html: {e}")
+
+        # 他のパートがある場合は再帰的に処理
+        for part in message.get("parts", []):
+            find_message_parts_text(part, message_parts)
+
+        return message_parts
+
+    try:
+        print(f"Processing email with MIME type: {payload.get('mimeType', 'unknown')}")
+        message_parts = find_message_parts_text(payload)
+
+        # text/plainを優先
+        if message_parts["text/plain"]:
+            return message_parts["text/plain"]
+
+        # text/plainがない場合はHTMLから抽出
+        if message_parts["text/html"]:
+            try:
+                from bs4 import BeautifulSoup
+                soup = BeautifulSoup(message_parts["text/html"], 'html.parser')
+                return soup.get_text(separator=' ', strip=True)
+            except Exception as e:
+                print(f"Error parsing HTML: {e}")
+
+        print("No text content found in email")
+        return ''
+
     except Exception as e:
-        print(f"Error decoding email body: {e}")
+        print(f"Error decoding email body: {str(e)}")
         print(f"Payload structure: {json.dumps(payload, indent=2)[:500]}")
         return ''
 
@@ -268,13 +345,25 @@ def save_to_bigquery(bq_client, property_data_list):
             print("保存するデータがありません")
             return False
 
+        # BigQuery保存用にデータを変換
+        converted_properties = []
+        for property_data in property_data_list:
+            converted_data = property_data.copy()
+
+            # 万円単位のフィールドを円単位に変換
+            for field in ['road_price', 'expected_rent_income']:
+                if field in converted_data:
+                    converted_data[field] = convert_to_yen(converted_data[field])
+
+            converted_properties.append(converted_data)
+
         table_id = f"{os.environ['PROJECT_ID']}.property_data.properties"
-        errors = bq_client.insert_rows_json(table_id, property_data_list)
+        errors = bq_client.insert_rows_json(table_id, converted_properties)
         if errors:
             print(f"BigQuery insertion errors: {errors}")
             return False
 
-        print(f"{len(property_data_list)}件の物件データをBigQueryに保存しました")
+        print(f"{len(converted_properties)}件の物件データをBigQueryに保存しました")
         return True
     except Exception as e:
         print(f"Error saving to BigQuery: {e}")
@@ -332,11 +421,17 @@ def process_property_email(message_data, service, model, bq_client):
         # 本文のデコード
         body = decode_email_body(msg['payload'])
         if not body:
+            # メールを既読にマーク
+            if not mark_as_read(service, message_data['id']):
+                print("既読マークに失敗")
             print("本文が空のためスキップ")
             return None
 
         # 不動産関連チェック
         if not ('不動産' in body or '物件' in body):
+            # メールを既読にマーク
+            if not mark_as_read(service, message_data['id']):
+                print("既読マークに失敗")
             print("不動産関連のキーワードが含まれていないためスキップ")
             return None
 
@@ -356,6 +451,9 @@ def process_property_email(message_data, service, model, bq_client):
 
         property_data_list = analyze_email_with_gemini(model, body, subject)
         if not property_data_list:
+            # メールを既読にマーク
+            if not mark_as_read(service, message_data['id']):
+                print("既読マークに失敗")
             print("Geminiでの分析結果が空のためスキップ")
             return None
 
@@ -363,6 +461,9 @@ def process_property_email(message_data, service, model, bq_client):
 
         filtered_properties = filter_valid_properties(property_data_list)
         if not filtered_properties:
+            # メールを既読にマーク
+            if not mark_as_read(service, message_data['id']):
+                print("既読マークに失敗")
             print("処理可能な物件データがありません")
             return None
 
@@ -376,6 +477,9 @@ def process_property_email(message_data, service, model, bq_client):
                 print("物件データの準備に失敗")
 
         if not processed_properties:
+            # メールを既読にマーク
+            if not mark_as_read(service, message_data['id']):
+                print("既読マークに失敗")
             print("処理可能な物件データがありません")
             return None
 
@@ -414,7 +518,7 @@ def process_unread_property_emails(service, model, bq_client):
         # 未読メールの検索
         results = service.users().messages().list(
             userId='me',
-            q='is:unread　to:fudousan.okada@gmail.com',
+            q='is:unread label:不動産',
             maxResults=100
         ).execute()
 
