@@ -9,7 +9,7 @@ import base64
 import time
 import vertexai
 import logging
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from bs4 import BeautifulSoup
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
@@ -35,14 +35,23 @@ TOKEN_FILE_NAME = os.environ['TOKEN_FILE_NAME']
 EMAIL_ADDRESS = os.environ['EMAIL_ADDRESS']
 
 
+def get_jst_now():
+    """現在時刻をJST(UTC+9)で取得"""
+    JST = timezone(timedelta(hours=+9), 'JST')
+    return datetime.now(JST).isoformat()
+
 def format_date(date_str):
-    """メールのタイムスタンプをBigQuery用のISO形式に変換"""
+    """メールのタイムスタンプをBigQuery用のISO形式に変換（JST）"""
     try:
+        # メールのタイムスタンプをパース
         parsed_date = parsedate_to_datetime(date_str)
-        return parsed_date.isoformat()
+        # JSTに変換
+        JST = timezone(timedelta(hours=+9), 'JST')
+        jst_date = parsed_date.astimezone(JST)
+        return jst_date.isoformat()
     except Exception as e:
         logger.error(f"日付変換エラー: {e}")
-        return datetime.now().isoformat()
+        return get_jst_now()
 
 
 def convert_to_yen(value):
@@ -141,7 +150,7 @@ def extract_email_headers(headers):
         return subject, from_email, date
     except Exception as e:
         logger.error(f"ヘッダー抽出エラー: {e}", exc_info=True)
-        return 'No Subject', '', datetime.now().isoformat()
+        return 'No Subject', '', get_jst_now()
 
 
 def decode_email_body(payload):
@@ -206,7 +215,6 @@ def decode_email_body(payload):
         logger.error(f"メール本文デコードエラー: {str(e)}", exc_info=True)
         logger.debug(f"Payload structure: {json.dumps(payload, indent=2)[:500]}")
         return ''
-
 
 @retry(
     stop=stop_after_attempt(3),
@@ -297,11 +305,8 @@ def analyze_email_with_gemini(model, email_content, email_subject):
             result = json.loads(response.text)
         except json.JSONDecodeError as e:
             logger.error(f"Gemini応答のJSONパースに失敗: {e}")
-            logger.debug(f"受信した応答: {response.text[:500]}")
-            return {
-                "error": "解析エラー",
-                "raw_response": response.text[:500]
-            }
+            logger.info(f"受信した応答: {response.text}")
+            raise e
 
         if not isinstance(result, list):
             logger.warning(f"""
@@ -314,6 +319,8 @@ def analyze_email_with_gemini(model, email_content, email_subject):
         logger.info(f"Gemini分析成功: {len(result)}件の物件情報を抽出")
         return result
 
+    except json.JSONDecodeError as e:
+        return []
     except Exception as e:
         logger.error(f"Gemini分析中にエラーが発生: {str(e)}", exc_info=True)
         raise e
@@ -321,7 +328,7 @@ def analyze_email_with_gemini(model, email_content, email_subject):
 def prepare_property_data(property_data, email_info):
     """プロパティデータに必要なフィールドを追加"""
     try:
-        current_time = datetime.now().isoformat()
+        current_time = get_jst_now()
         property_data.update({
             'id': str(uuid.uuid4()),
             'email_id': email_info['id'],
@@ -441,7 +448,12 @@ def process_property_email(message_data, service, model, bq_client):
         logger.debug(f"subject: {subject}")
         logger.debug(f"body: {body}")
 
+        # TODO: Geminiの出力上限に達すると、途中までで結果が返ってきてJSONが不完全でJSONパースエラーが発生する
+        # 出力上限に達する前に返してもらってフラグで続きをリクエストするか制御が必要。ただし現在の1.5-flashだと意図通り実現できず
+        # 次の安価のモデルが出たら試す、もしくは出力上限が拡大されたモデルならそもそも対応が不要になる
+        # 現在はパースエラーになった時は既読にしてスキップさせる
         property_data_list = analyze_email_with_gemini(model, body, subject)
+
         if not property_data_list:
             logger.info(f"メールID {message_data['id']}: Gemini分析結果が空のためスキップ")
             mark_as_read(service, message_data['id'])
