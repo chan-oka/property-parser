@@ -58,9 +58,12 @@ def convert_to_yen(value):
     """万円単位の数値を円単位の整数値に変換"""
     try:
         if value is None:
-            return None
+            return 0
 
         if isinstance(value, str):
+            if not value.strip():
+                return 0
+
             value = value.replace(',', '')
             value = float(value)
 
@@ -68,6 +71,94 @@ def convert_to_yen(value):
 
     except (ValueError, TypeError) as e:
         logger.warning(f"円単位変換失敗: Value: {value}, Error: {e}")
+        return None
+
+
+def convert_floor_to_int(floor_str):
+    """
+    階数文字列を整数に変換
+    例：
+    - '1F', '1階', '1' → 1
+    - 'B1F', 'B1', '地下1階', '地下1' → -1
+    - '15F', '15階' → 15
+    - 'B2F', 'B2', '地下2階' → -2
+    """
+    if not floor_str:
+        return None
+
+    try:
+        if isinstance(floor_str, int):
+            return floor_str
+
+        floor_str = str(floor_str).upper().strip()
+
+        # 数字のみの場合
+        if floor_str.isdigit():
+            return int(floor_str)
+
+        # 地下階の場合
+        if 'B' in floor_str or '地下' in floor_str:
+            number = int(''.join(filter(str.isdigit, floor_str)))
+            return -number
+
+        # 地上階の場合
+        return int(''.join(filter(str.isdigit, floor_str)))
+
+    except Exception as e:
+        print(f"Floor number conversion error for: {floor_str} - Error: {str(e)}")
+        return None
+
+
+def convert_japanese_era_date(date_str):
+    """
+    和暦の場合のみ西暦に変換。それ以外はそのまま返す。
+    """
+    if not date_str or not isinstance(date_str, str):
+        return date_str
+
+    try:
+        date_str = date_str.upper().strip()
+
+        # 和暦の場合のみ変換
+        if any(era in date_str for era in ['R', 'H', 'S']):
+            number = int(''.join(filter(str.isdigit, date_str)))
+            if 'R' in date_str:  # 令和
+                year = 2018 + number
+            elif 'H' in date_str:  # 平成
+                year = 1988 + number
+            elif 'S' in date_str:  # 昭和
+                year = 1925 + number
+            return f"{year}-01-01"
+
+        # 和暦以外はそのまま返す
+        return date_str
+
+    except Exception as e:
+        print(f"Date conversion error for: {date_str} - Error: {str(e)}")
+        return date_str
+
+
+def convert_building_age(age_str):
+    """
+    築年数を整数に変換
+    例：
+    - '3.9' → 3
+    - '10.5' → 10
+    - '5' → 5
+    """
+    if not age_str:
+        return None
+
+    try:
+        if isinstance(age_str, (int, float)):
+            return int(age_str)
+
+        # 文字列から数値を抽出して整数化
+        age_str = str(age_str).strip()
+        return int(float(age_str))
+
+    except Exception as e:
+        print(f"Building age conversion error for: {age_str} - Error: {str(e)}")
         return None
 
 
@@ -373,16 +464,31 @@ def save_to_bigquery(bq_client, property_data_list):
             converted_data = property_data.copy()
 
             # 万円単位のフィールドを円単位に変換
-            for field in ['road_price', 'expected_rent_income']:
+            for field in ['road_price', 'current_rent_income', 'expected_rent_income']:
                 if field in converted_data:
                     converted_data[field] = convert_to_yen(converted_data[field])
+
+            # 階数文字列を整数に変換
+            for field in ['floor_number']:
+                if field in converted_data:
+                    converted_data[field] = convert_floor_to_int(converted_data[field])
+
+            # 階数文字列を整数に変換
+            for field in ['construction_date']:
+                if field in converted_data:
+                    converted_data[field] = convert_japanese_era_date(converted_data[field])
+
+            # 階数文字列を整数に変換
+            for field in ['building_age']:
+                if field in converted_data:
+                    converted_data[field] = convert_building_age(converted_data[field])
 
             converted_properties.append(converted_data)
 
         table_id = f"{os.environ['PROJECT_ID']}.property_data.properties"
         errors = bq_client.insert_rows_json(table_id, converted_properties)
         if errors:
-            logger.error(f"BigQueryデータ挿入エラー: {errors}")
+            logger.error(f"BigQueryデータ挿入エラー: {errors} 挿入データ: {json.dumps(converted_properties, indent=2, ensure_ascii=False)}")
             return False
 
         logger.info(f"{len(converted_properties)}件の物件データをBigQueryに保存しました")
