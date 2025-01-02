@@ -138,6 +138,55 @@ def convert_japanese_era_date(date_str):
         return date_str
 
 
+def convert_construction_date(value):
+    """
+    建築年月日を単一の日付文字列に変換
+    無効な日付（月末日を超える場合）は月初に修正
+    """
+    import calendar
+    from datetime import datetime
+
+    try:
+        if value is None:
+            return None
+
+        # 配列の場合は最初の要素を使用
+        if isinstance(value, list):
+            if not value:
+                return None
+            value = value[0]
+
+        # 和暦の場合は西暦に変換
+        date_str = str(value).upper().strip()
+        if any(era in date_str for era in ['R', 'H', 'S']):
+            number = int(''.join(filter(str.isdigit, date_str)))
+            if 'R' in date_str:  # 令和
+                year = 2018 + number
+            elif 'H' in date_str:  # 平成
+                year = 1988 + number
+            elif 'S' in date_str:  # 昭和
+                year = 1925 + number
+            return f"{year}-01-01"
+
+        # YYYY-MM-DD形式の場合
+        if '-' in date_str:
+            try:
+                year, month, day = map(int, date_str.split('-'))
+                # その月の最終日を取得
+                _, last_day = calendar.monthrange(year, month)
+                # 日が月末を超えている場合は1日に設定
+                if day > last_day:
+                    day = 1
+                return f"{year:04d}-{month:02d}-{day:02d}"
+            except ValueError:
+                return None
+
+        return date_str
+
+    except Exception as e:
+        logger.warning(f"建築年月日変換失敗: Value: {value}, Error: {e}")
+        return None
+
 def convert_building_age(age_str):
     """
     築年数を整数に変換
@@ -161,6 +210,30 @@ def convert_building_age(age_str):
         print(f"Building age conversion error for: {age_str} - Error: {str(e)}")
         return None
 
+def convert_station_distance(value):
+   """
+   駅からの距離を徒歩分数（整数）に変換（小数点切り上げ）
+   例：
+   - 12.5 → 13
+   - 5.1 → 6
+   - 10.0 → 10
+   """
+   try:
+       if value is None:
+           return None
+
+       # 文字列の場合、数値以外を削除して浮動小数点に変換
+       if isinstance(value, str):
+           value = value.replace('徒歩', '').replace('分', '').replace(',', '').strip()
+           value = float(value)
+
+       # floatの場合は小数点以下を切り上げ
+       import math
+       return int(math.ceil(float(value)))
+
+   except (ValueError, TypeError) as e:
+       logger.warning(f"徒歩分数変換失敗: Value: {value}, Error: {e}")
+       return None
 
 def setup_gmail_service():
     """Gmail APIのセットアップ - トークンベースの認証を使用"""
@@ -464,7 +537,7 @@ def save_to_bigquery(bq_client, property_data_list):
             converted_data = property_data.copy()
 
             # 万円単位のフィールドを円単位に変換
-            for field in ['road_price', 'current_rent_income', 'expected_rent_income']:
+            for field in ['road_price', 'current_rent_income', 'expected_rent_income', 'estimated_price', 'management_fee']:
                 if field in converted_data:
                     converted_data[field] = convert_to_yen(converted_data[field])
 
@@ -476,19 +549,23 @@ def save_to_bigquery(bq_client, property_data_list):
             # 階数文字列を整数に変換
             for field in ['construction_date']:
                 if field in converted_data:
-                    converted_data[field] = convert_japanese_era_date(converted_data[field])
+                    converted_data[field] = convert_construction_date(converted_data[field])
 
-            # 階数文字列を整数に変換
+            # 築年月
             for field in ['building_age']:
                 if field in converted_data:
                     converted_data[field] = convert_building_age(converted_data[field])
+
+            for field in ['station_distance']:
+                if field in converted_data:
+                    converted_data[field] = convert_station_distance(converted_data[field])
 
             converted_properties.append(converted_data)
 
         table_id = f"{os.environ['PROJECT_ID']}.property_data.properties"
         errors = bq_client.insert_rows_json(table_id, converted_properties)
         if errors:
-            logger.error(f"BigQueryデータ挿入エラー: {errors} 挿入データ: {json.dumps(converted_properties, indent=2, ensure_ascii=False)}")
+            logger.error(f"BigQueryデータ挿入エラー: {errors} 挿入データ: {converted_properties}")
             return False
 
         logger.info(f"{len(converted_properties)}件の物件データをBigQueryに保存しました")
